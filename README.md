@@ -4,6 +4,10 @@
 
 Лёгкая утилита на Go, которая читает уровень заряда подключённых наушников и отображает его прямо в области уведомлений панели задач — в виде цифры на иконке.
 
+<img width="72" height="212" alt="изображение" src="https://github.com/user-attachments/assets/365bea5c-2bc2-45d6-80b3-6757cc388653" />
+
+<img width="221" height="99" alt="изображение" src="https://github.com/user-attachments/assets/fb6f6d1a-d549-42e7-95cd-056689313278" />
+
 ---
 
 ## Возможности
