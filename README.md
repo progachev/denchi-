@@ -35,7 +35,7 @@
 ```bash
 # 1. Клонируйте репозиторий
 git clone https://github.com/progachev/denchi-.git
-cd denchi
+cd denchi-
 
 # 2. Загрузите зависимости
 go mod tidy
