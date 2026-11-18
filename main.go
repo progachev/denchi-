@@ -1,152 +1,208 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
 	"log"
+	"strconv"
 	"time"
 
+	"github.com/biessek/golang-ico"
 	"github.com/getlantern/systray"
 	"github.com/ushineko/sanshoku"
 	"github.com/ushineko/sanshoku/all"
 	"github.com/ushineko/sanshoku/battery"
-    "github.com/biessek/golang-ico"
-    "bytes"
-    "image"
-    "image/color"
-    "strconv"
-
-    "golang.org/x/image/font"
-    "golang.org/x/image/font/basicfont"
-    "golang.org/x/image/math/fixed"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
 )
 
+const (
+	// iconSize — сторона квадратной иконки трея (пиксели).
+	iconSize = 16
 
-// generateBatteryIcon создаёт ico-изображение размером с текстом заряда батареи
-func generateBatteryIcon(level int) ([]byte, error) {
-    size := 16 
-    img := image.NewRGBA(image.Rect(0, 0, size, size))
+	// scanPeriod — интервал опроса заряда. Bluetooth-сканирование дорогое,
+	// поэтому не стоит опрашивать чаще раза в несколько минут.
+	scanPeriod = 5 * time.Minute
 
-    // Заливаем фон
-    for y := 0; y < size; y++ {
-        for x := 0; x < size; x++ {
-            img.Set(x, y, color.RGBA{40, 40, 40, 255})
-        }
-    }
+	// baselineOffset — поправка вертикального центрирования текста
+	// для basicfont.Face7x13 на холсте iconSize x iconSize.
+	baselineOffset = 1
+)
 
-    text := strconv.Itoa(level)
+// iconData — .ico-иконка по умолчанию, показывается до первого успешного опроса.
+// ВАЖНО: замените на реальные байты .ico-файла. Пока заглушка — приложение
+// запустится, но иконка будет пустой; при первом успешном опросе она обновится.
+var iconData = []byte{}
 
-    face := basicfont.Face7x13
-    textWidth := len(text) * face.Advance
-    startX := (size - textWidth) / 2
-    startY := (size+face.Height)/2 + 1
+// appCancel позволяет onExit остановить фоновые горутины.
+var appCancel context.CancelFunc
 
-    d := &font.Drawer{
-        Dst:  img,
-        Src:  image.NewUniform(color.White),
-        Face: face,
-        Dot:  fixed.P(startX, startY),
-    }
-    d.DrawString(text)
+// generateBatteryIconICO рисует квадрат iconSize x iconSize с числом заряда
+// и кодирует результат в ICO. Возвращает байты, пригодные для systray.SetIcon.
+// Уровень клампится в диапазон [0, 100].
+func generateBatteryIconICO(level int) ([]byte, error) {
+	if level < 0 {
+		level = 0
+	}
+	if level > 100 {
+		level = 100
+	}
 
-    var buf bytes.Buffer
-    if err := ico.Encode(&buf, img); err != nil {
-        return nil, err
-    }
-    return buf.Bytes(), nil
+	img := image.NewRGBA(image.Rect(0, 0, iconSize, iconSize))
+
+	// Заливаем фон одним вызовом — быстрее, чем img.Set в двойном цикле.
+	draw.Draw(
+		img,
+		img.Bounds(),
+		&image.Uniform{C: color.RGBA{R: 40, G: 40, B: 40, A: 255}},
+		image.Point{},
+		draw.Src,
+	)
+
+	text := strconv.Itoa(level)
+	face := basicfont.Face7x13
+
+	textWidth := len(text) * int(face.Advance)
+	startX := (iconSize - textWidth) / 2
+	// Базовая линия Face7x13 находится внизу; для вертикального центрирования
+	// на холсте высотой iconSize используем (iconSize+face.Height)/2 + baselineOffset.
+	startY := (iconSize+face.Height)/2 + baselineOffset
+
+	d := &font.Drawer{
+		Dst:  img,
+		Src:  image.NewUniform(color.White),
+		Face: face,
+		Dot:  fixed.P(startX, startY),
+	}
+	d.DrawString(text)
+
+	var buf bytes.Buffer
+	if err := ico.Encode(&buf, img); err != nil {
+		return nil, fmt.Errorf("encode ico: %w", err)
+	}
+	return buf.Bytes(), nil
 }
-
-var iconData = []byte{ /* ... данные .ico файла ... */ }
 
 func main() {
 	systray.Run(onReady, onExit)
 }
 
 func onReady() {
-	// Устанавливаем иконку и подсказку по умолчанию
-	systray.SetIcon(iconData)
-	systray.SetTitle("Battery") // На Windows Title не отображается
+	if len(iconData) > 0 {
+		systray.SetIcon(iconData)
+	}
 	systray.SetTooltip("Чтение заряда наушников...")
 
-	// Добавляем пункт меню для выхода
 	mQuit := systray.AddMenuItem("Выход", "Закрыть приложение")
 
-	// Запускаем фоновое обновление заряда
-	go updateBatteryLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	appCancel = cancel
 
-	// Обработка нажатия на "Выход"
+	go updateBatteryLoop(ctx)
+
 	go func() {
-		<-mQuit.ClickedCh
+		select {
+		case <-mQuit.ClickedCh:
+		case <-ctx.Done():
+		}
 		systray.Quit()
 	}()
 }
 
 func onExit() {
-	// Здесь можно что-то прибрать, если нужно
+	if appCancel != nil {
+		appCancel()
+	}
 }
 
-func updateBatteryLoop() {
-	// Создаём контекст для операций sanshoku
-	ctx := context.Background()
-
-	// Получаем список драйверов. Нам нужны все, чтобы не пропустить Bluetooth.
+// updateBatteryLoop периодически сканирует устройства, читает заряд и обновляет
+// иконку и tooltip. Завершается по отмене ctx.
+func updateBatteryLoop(ctx context.Context) {
 	drivers := all.Drivers()
+	ticker := time.NewTicker(scanPeriod)
+	defer ticker.Stop()
+
+	// Первый опрос — сразу, не ждём тик.
+	refreshBattery(ctx, drivers)
 
 	for {
-		// Пытаемся найти устройства и прочитать заряд
-		found, err := sanshoku.Scan(ctx, drivers...)
-		if err != nil {
-			// Ошибка сканирования (например, нет прав или устройство не отвечает)
-			// Просто логируем и продолжаем, чтобы не спамить в трей
-			log.Printf("Scan error: %v", err)
-			systray.SetTooltip("Ошибка сканирования")
-			time.Sleep(1 * time.Minute)
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshBattery(ctx, drivers)
 		}
-
-		foundBattery := false
-
-		var batteryName string
-		var batteryLevel int
-
-		for _, c := range found {
-			dev, err := c.Open(ctx)
-			if err != nil {
-				continue
-			}
-
-			if src, ok := dev.(battery.Source); ok {
-				batteries, err := src.Batteries(ctx)
-				if err == nil {
-					for _, b := range batteries {
-						if b.HasLevel {
-							// Сохраняем значения в внешние переменные
-							batteryName = b.Name
-							batteryLevel = b.Level
-							foundBattery = true
-							break
-						}
-					}
-				}
-			}
-			dev.Close()
-
-			if foundBattery {
-				break
-			}
-		}
-
-		if foundBattery {
-			levelInt := int(batteryLevel)
-			iconBytes, err := generateBatteryIcon(levelInt)
-			if err == nil {
-				systray.SetIcon(iconBytes)
-			}
-			systray.SetTooltip(fmt.Sprintf("%s: %d%%", batteryName, levelInt))
-		} else {
-			systray.SetTooltip("Наушники не найдены или заряд недоступен")
-		}
-
-		time.Sleep(1 * time.Minute)
 	}
+}
+
+// refreshBattery делает один цикл: сканирует, находит первую батарею с уровнем,
+// обновляет иконку и tooltip. Ошибки не прерывают цикл — только логируются.
+func refreshBattery(ctx context.Context, drivers []sanshoku.Driver) {
+	found, err := sanshoku.Scan(ctx, drivers...)
+	if err != nil {
+		log.Printf("scan: %v", err)
+		systray.SetTooltip("Ошибка сканирования")
+		return
+	}
+
+	name, level, ok := findBattery(ctx, found)
+	if !ok {
+		systray.SetTooltip("Наушники не найдены или заряд недоступен")
+		return
+	}
+
+	iconBytes, err := generateBatteryIconICO(level)
+	if err != nil {
+		log.Printf("generate icon: %v", err)
+		// Иконку не обновили, но tooltip обновим — это полезная информация.
+	} else {
+		systray.SetIcon(iconBytes)
+	}
+
+	systray.SetTooltip(fmt.Sprintf("%s: %d%%", name, level))
+}
+
+// findBattery перебирает найденные кандидаты и возвращает первую батарею
+// с известным уровнем.
+func findBattery(ctx context.Context, candidates []sanshoku.Candidate) (name string, level int, ok bool) {
+	for _, c := range candidates {
+		if name, level, ok := readOne(ctx, c); ok {
+			return name, level, true
+		}
+	}
+	return "", 0, false
+}
+
+// readOne открывает одного кандидата, читает батареи и корректно закрывает
+// устройство через defer — даже если внутри произойдёт ошибка или паника.
+func readOne(ctx context.Context, c sanshoku.Candidate) (name string, level int, ok bool) {
+	dev, err := c.Open(ctx)
+	if err != nil {
+		log.Printf("open: %v", err)
+		return "", 0, false
+	}
+	defer dev.Close()
+
+	src, isBattery := dev.(battery.Source)
+	if !isBattery {
+		return "", 0, false
+	}
+
+	batteries, err := src.Batteries(ctx)
+	if err != nil {
+		log.Printf("batteries: %v", err)
+		return "", 0, false
+	}
+
+	for _, b := range batteries {
+		if b.HasLevel {
+			return b.Name, int(b.Level), true
+		}
+	}
+	return "", 0, false
 }
